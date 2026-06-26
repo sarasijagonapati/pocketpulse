@@ -2,6 +2,8 @@ package com.example.pocketpulse;
 
 import android.accessibilityservice.AccessibilityService;
 import android.content.Intent;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
@@ -13,20 +15,25 @@ import java.util.regex.Pattern;
 public class PocketPulseAccessibilityService extends AccessibilityService {
     private static final String TAG = "PP_TRACKER";
     private PocketPulseRepository repository;
-    private final Pattern amountPattern = Pattern.compile("(?:₹|Rs\\.?|INR)\\s*([0-9,]+(?:\\.[0-9]{2})?)");
+    private final Pattern amountPattern = Pattern.compile("(?:₹|Rs\\.?|INR)\\s*([0-9,]+(?:\\.[0-9]{1,2})?)");
 
     private String lastCapturedAmount = "";
     private long lastTriggeredTime = 0;
 
-    // ⏱️ UI Settle Mechanics: Prevents Android from reading stale screen caches during transitions
-    private final android.os.Handler settleHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Handler settleHandler = new Handler(Looper.getMainLooper());
     private Runnable settleRunnable;
+
+    // FIX 4: Retry mechanism — tries up to 5 times every 500ms until recipient name is found
+    private int retryCount = 0;
+    private static final int MAX_RETRIES = 5;
+    private static final long RETRY_INTERVAL_MS = 500L;
+    private static final long INITIAL_DELAY_MS = 1000L; // FIX 1: Increased from 600ms to 1000ms
 
     @Override
     public void onCreate() {
         super.onCreate();
         repository = new PocketPulseRepository(this);
-        Log.d(TAG, "🟢 PocketPulse Accessibility Service successfully started initialization!");
+        Log.d(TAG, "🟢 PocketPulse Accessibility Service successfully started!");
     }
 
     @Override
@@ -34,45 +41,45 @@ public class PocketPulseAccessibilityService extends AccessibilityService {
         if (event == null) return;
 
         int eventType = event.getEventType();
-        // Only trigger on actual window adjustments or content updates
         if (eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
                 eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
 
-            // Cancel any pending scan jobs. We only want to execute ONCE after the screen stops flickering.
+            // Cancel any pending scan
             if (settleRunnable != null) {
                 settleHandler.removeCallbacks(settleRunnable);
             }
 
-            // Schedule the scanner to run exactly 300ms after the page finishes layout shifts
-            settleRunnable = () -> {
-                AccessibilityNodeInfo rootNode = getRootInActiveWindow();
-                if (rootNode == null) return;
+            // Reset retry counter on new screen event
+            retryCount = 0;
 
-                List<String> screenTexts = new ArrayList<>();
-                traverseNodeTree(rootNode, screenTexts);
-                rootNode.recycle();
+            // FIX 1: Start with 1000ms initial delay instead of 600ms
+            settleRunnable = () -> attemptRead();
+            settleHandler.postDelayed(settleRunnable, INITIAL_DELAY_MS);
+        }
+    }
 
-                Log.d(TAG, "📄 Settled text discovered on screen layout: " + screenTexts.toString());
+    // FIX 4: Separated reading into its own method so it can be retried
+    private void attemptRead() {
+        AccessibilityNodeInfo rootNode = getRootInActiveWindow();
+        if (rootNode == null) return;
 
-                // 1. Verify it matches a successful payment layout pattern
-                if (verifySuccessState(screenTexts)) {
+        List<String> screenTexts = new ArrayList<>();
+        traverseNodeTree(rootNode, screenTexts);
+        rootNode.recycle();
 
-                    // 📅 2. Date Safety Layer: Drop if it's from a previous day
-                    if (!isTransactionFromToday(screenTexts)) {
-                        return;
-                    }
+        Log.d(TAG, "📄 Screen texts (attempt " + (retryCount + 1) + "): " + screenTexts);
 
-                    // ⏰ 3. Time Safety Layer: Drop if it's older than our 4-minute window
-                    if (!isTransactionWithinTimeWindow(screenTexts)) {
-                        return;
-                    }
+        if (!verifySuccessState(screenTexts)) return;
+        if (!isTransactionFromToday(screenTexts)) return;
+        if (!isTransactionWithinTimeWindow(screenTexts)) return;
 
-                    Log.d(TAG, "🚀 Clear pass! Processing authentic live transaction values...");
-                    parseAndProcessScreen(screenTexts);
-                }
-            };
+        // FIX 4: Try to parse — if recipient is missing, retry
+        boolean parsed = parseAndProcessScreen(screenTexts);
 
-            settleHandler.postDelayed(settleRunnable, 600); // 600ms window settling delay
+        if (!parsed && retryCount < MAX_RETRIES) {
+            retryCount++;
+            Log.d(TAG, "🔄 Recipient not found, retrying... attempt " + retryCount);
+            settleHandler.postDelayed(this::attemptRead, RETRY_INTERVAL_MS);
         }
     }
 
@@ -97,20 +104,17 @@ public class PocketPulseAccessibilityService extends AccessibilityService {
         for (String node : textNodes) {
             String text = node.toLowerCase().trim();
 
-            // BLOCK HISTORY & SEARCH VIEWS
             if (text.contains("my statements") || text.contains("transaction history") ||
                     text.contains("all transactions") || text.equals("search") || text.equals("history")) {
                 isHistoryOrListScreen = true;
             }
 
-            // Check for standard individual receipt indicators
             if (text.contains("successful") || text.contains("paid successfully") ||
                     text.contains("money sent") || text.contains("payment successful") ||
                     text.contains("paid to")) {
                 hasSuccessWord = true;
             }
 
-            // Detect if this is actually incoming money
             if (text.contains("received from") || text.contains("credited to")) {
                 isIncomingMoney = true;
             }
@@ -119,10 +123,22 @@ public class PocketPulseAccessibilityService extends AccessibilityService {
         return hasSuccessWord && !isIncomingMoney && !isHistoryOrListScreen;
     }
 
-    private void parseAndProcessScreen(List<String> nodes) {
+    // FIX 2: Returns boolean — true if amount+recipient found, false if we should retry
+    private boolean parseAndProcessScreen(List<String> nodes) {
         String amountStr = "";
         String extractedRecipient = "";
 
+        // FIX 2: First pass — collect ALL valid merchant name candidates from the ENTIRE list
+        // PhonePe puts the recipient name early in the tree, not always near the amount
+        List<String> recipientCandidates = new ArrayList<>();
+        for (String node : nodes) {
+            if (isValidMerchantName(node)) {
+                recipientCandidates.add(node);
+                Log.d(TAG, "👤 Recipient candidate: " + node);
+            }
+        }
+
+        // Second pass — find the amount
         for (int i = 0; i < nodes.size(); i++) {
             String cleanLine = nodes.get(i);
             String lowerLine = cleanLine.toLowerCase();
@@ -134,52 +150,58 @@ public class PocketPulseAccessibilityService extends AccessibilityService {
             Matcher matcher = amountPattern.matcher(cleanLine);
             if (matcher.find()) {
                 amountStr = matcher.group(1).replace(",", "");
-                Log.d(TAG, "🎯 Matched amount via regex engine: " + amountStr);
+                Log.d(TAG, "🎯 Amount found: " + amountStr);
 
-                // Window search radar (Checks up to 3 nodes away for user profile name text)
+                // FIX 2: Try nearby nodes first (original logic)
                 for (int offset = 1; offset <= 3; offset++) {
-                    if (i - offset >= 0) {
-                        String candidate = nodes.get(i - offset);
-                        if (isValidMerchantName(candidate)) {
-                            extractedRecipient = candidate;
+                    if (i - offset >= 0 && isValidMerchantName(nodes.get(i - offset))) {
+                        extractedRecipient = nodes.get(i - offset);
+                        break;
+                    }
+                }
+                if (extractedRecipient.isEmpty()) {
+                    for (int offset = 1; offset <= 3; offset++) {
+                        if (i + offset < nodes.size() && isValidMerchantName(nodes.get(i + offset))) {
+                            extractedRecipient = nodes.get(i + offset);
                             break;
                         }
                     }
                 }
 
-                if (extractedRecipient.isEmpty()) {
-                    for (int offset = 1; offset <= 3; offset++) {
-                        if (i + offset < nodes.size()) {
-                            String candidate = nodes.get(i + offset);
-                            if (isValidMerchantName(candidate)) {
-                                extractedRecipient = candidate;
-                                break;
-                            }
-                        }
-                    }
+                // FIX 2: Fallback — use first candidate from full-list scan
+                if (extractedRecipient.isEmpty() && !recipientCandidates.isEmpty()) {
+                    extractedRecipient = recipientCandidates.get(0);
+                    Log.d(TAG, "💡 Used full-scan fallback for recipient: " + extractedRecipient);
                 }
+
                 break;
             }
         }
 
         if (amountStr.isEmpty()) {
-            Log.d(TAG, "❌ Aborting: Screen parser failed to identify currency digits.");
-            return;
+            Log.d(TAG, "❌ Amount not found on screen.");
+            return false; // retry
+        }
+
+        // FIX 4: If recipient is still empty, signal retry (don't show popup with wrong data)
+        if (extractedRecipient.isEmpty()) {
+            Log.d(TAG, "⚠️ Amount found but recipient still empty — will retry.");
+            return false;
         }
 
         long currentTime = System.currentTimeMillis();
         if (amountStr.equals(lastCapturedAmount) && (currentTime - lastTriggeredTime < 6000)) {
-            Log.d(TAG, "🛡️ Aborting duplicate scan action loop via debouncer window interval.");
-            return;
+            Log.d(TAG, "🛡️ Duplicate debounced.");
+            return true; // don't retry, just skip
         }
 
         lastCapturedAmount = amountStr;
         lastTriggeredTime = currentTime;
 
         final double finalAmount = Double.parseDouble(amountStr);
-        final String finalRecipient = extractedRecipient.isEmpty() ? "Unknown Merchant" : extractedRecipient;
+        final String finalRecipient = extractedRecipient;
 
-        Log.d(TAG, "🚀 Dispatching overlay command. Amount: " + finalAmount + " | Recipient: " + finalRecipient);
+        Log.d(TAG, "🚀 Launching popup — Amount: ₹" + finalAmount + " | Recipient: " + finalRecipient);
 
         repository.checkDuplicateTransaction(finalAmount, isDuplicate -> {
             if (!isDuplicate) {
@@ -188,31 +210,45 @@ public class PocketPulseAccessibilityService extends AccessibilityService {
                 dialogIntent.putExtra("EXTRA_RECIPIENT", finalRecipient);
                 dialogIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
                 startActivity(dialogIntent);
-                Log.d(TAG, "🎉 Bottom Sheet intent launched over screen layout background!");
+                Log.d(TAG, "🎉 Popup launched successfully!");
             } else {
-                Log.d(TAG, "🛑 Database flagged this transaction entry as a timestamp duplicate.");
+                Log.d(TAG, "🛑 Duplicate transaction — skipped.");
             }
         });
+
+        return true; // success, no retry needed
     }
 
+    // FIX 3: Improved — no longer blocks emoji names, checks only actual junk patterns
     private boolean isValidMerchantName(String input) {
         if (input == null || input.trim().isEmpty()) return false;
         String check = input.toLowerCase().trim();
 
+        // Block known junk keywords
         if (check.contains("successful") || check.contains("paid successfully") ||
                 check.contains("debited") || check.contains("sent") || check.contains("received") ||
                 check.contains("credited") || check.contains("utr") || check.contains("transaction id") ||
                 check.contains("ref") || check.contains("banking name") || check.contains("powered by") ||
                 check.contains("history") || check.contains("balance") || check.contains("view") ||
                 check.contains("share") || check.contains("money") || check.contains("transfer details") ||
-                check.equals("to") || check.equals("from")) {
+                check.contains("payment") || check.contains("split expense") ||
+                check.equals("to") || check.equals("from") || check.equals("done")) {
             return false;
         }
 
+        // Block UPI IDs
         if (check.contains("@")) return false;
-        if (check.contains("xxxx") || check.matches(".*\\d{3,}.*")) return false;
 
-        return input.length() > 2;
+        // FIX 3: Block strings that are PURELY numbers (phone numbers, amounts)
+        // but ALLOW names that happen to have some digits (e.g. "Shop123")
+        // Old regex check.matches(".*\\d{3,}.*") was too aggressive — blocked valid names near phone numbers
+        if (check.matches("^[\\d\\s+\\-().]+$")) return false; // pure number string
+
+        // Block masked card numbers
+        if (check.contains("xxxx")) return false;
+
+        // Must be at least 2 characters
+        return input.trim().length() > 2;
     }
 
     private boolean isTransactionFromToday(List<String> textNodes) {
@@ -247,7 +283,7 @@ public class PocketPulseAccessibilityService extends AccessibilityService {
                     int receiptHour = Integer.parseInt(matcher.group(1));
                     int receiptMinute = Integer.parseInt(matcher.group(2));
                     String amPmStr = matcher.group(3).toLowerCase();
-                    int receiptAmPm = (amPmStr.contains("pm")) ? java.util.Calendar.PM : java.util.Calendar.AM;
+                    int receiptAmPm = amPmStr.contains("pm") ? java.util.Calendar.PM : java.util.Calendar.AM;
 
                     if (currentAmPm != receiptAmPm) continue;
 
@@ -260,12 +296,13 @@ public class PocketPulseAccessibilityService extends AccessibilityService {
                         return true;
                     }
                 } catch (Exception e) {
-                    Log.e(TAG, "Error parsing layout time string", e);
+                    Log.e(TAG, "Error parsing time string", e);
                 }
             }
         }
         return false;
     }
 
-    @Override public void onInterrupt() {}
+    @Override
+    public void onInterrupt() {}
 }
